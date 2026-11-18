@@ -1,0 +1,23 @@
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+secrets.h
+secrets.json
+wiz_key.txt
+*.pem
+*.key
+
+# Personal calibration (generated locally)
+calibration*.json
+
+# Downloaded model (the Python program downloads it when needed)
+face_landmarker.task
+
+# Environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+.DS_Store
