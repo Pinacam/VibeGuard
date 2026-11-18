@@ -20,3 +20,8 @@ The shared sketches contain placeholders only. Configure Wi-Fi, hotspot and API 
 ## Hardware setup
 
 See the sketch comments for board configuration. Install the Arduino libraries referenced by each sketch. Exact tested dependency versions and complete hardware setup instructions still need to be documented. This source package has not been compiled or tested on the devices as part of repository preparation.
+
+## Project documents
+
+- [VibeGuard Gate 1](docs/VibeGuard_Gate1.pdf)
+- [VibeGuard project document](docs/VibeGuard%20%285%29.pdf)
