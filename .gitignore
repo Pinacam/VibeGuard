@@ -21,3 +21,12 @@ __pycache__/
 *.py[cod]
 build/
 .DS_Store
+
+# LaTeX intermediate files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.xdv
+/docs/gate1-source/main.pdf

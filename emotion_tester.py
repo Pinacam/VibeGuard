@@ -1,8 +1,8 @@
 """
 Facial expression tester: happy / sad / mad / neutral.
 
-Runs on the laptop webcam now; later the same script can read the ESP32-S3
-camera stream and tell the board which mood to show.
+Runs on the laptop webcam or an ESP32-S3 camera stream and sends accepted
+mood labels to the configured board, watch and WiZ bulb.
 
     python emotion_tester.py                          laptop webcam
     python emotion_tester.py --source http://IP:81/stream      ESP32 camera

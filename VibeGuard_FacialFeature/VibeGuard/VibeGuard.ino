@@ -6,11 +6,13 @@
     2. changes its light when told to    http://<board-ip>/mood?m=happy
 
   The laptop runs emotion_tester.py, which watches the stream, works out the
-  mood and calls /mood. By default the board makes its own WiFi network
-  ("MoodLight") and its address is 192.168.4.1, so connect the laptop to
-  that network and start the tester with:
+  mood and calls /mood. With OWN_WIFI=false, the board joins your configured
+  network. Use the IP address printed in Serial Monitor:
 
-    python emotion_tester.py --source http://192.168.4.1:81/stream --esp http://192.168.4.1
+    python emotion_tester.py --source http://BOARD_IP:81/stream --esp http://BOARD_IP
+
+  Optional OWN_WIFI=true creates a local access point at 192.168.4.1.
+  Configure its name/password locally; the voice watch needs internet access.
 
   Arduino IDE settings (Tools menu):
     Board:            ESP32S3 Dev Module
