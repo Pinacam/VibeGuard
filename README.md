@@ -4,6 +4,10 @@
 
 VibeGuard is a prototype that classifies four posed facial expressions on a laptop and sends matching mood commands to an ESP32-S3 camera/light board, a Waveshare voice watch and a WiZ lamp. It does not infer a person's actual feelings or establish therapeutic benefit.
 
+## Demo video
+
+[Watch the VibeGuard demo (74 s)](docs/vibeguard_commercial.mp4): the full system working together, with the camera reading the expression and the lamp, music and watch responding.
+
 ## Gate 1 submission
 
 - [Gate 1 report — IEEEtran PDF](docs/VibeGuard_Gate1.pdf)
