@@ -94,9 +94,6 @@ Open each `.ino` in its matching folder with Arduino IDE. Configure credentials 
 - Board: **ESP32S3 Dev Module**; partition: **Huge APP (3MB No OTA/1MB SPIFFS)**; PSRAM: **OPI PSRAM**. Keep `vg_fonts.h` in the same folder as the sketch.
 - Follow the board manufacturer's setup for the exact hardware revision. Tested Arduino core/library versions and full watch build settings have not yet been captured; a reproducible hardware build remains outstanding.
 
-## Credentials and personal data
-
-Published sketches contain placeholders. Do not commit Wi-Fi/hotspot passwords, API keys, `wiz_key.txt`, `.env` files or personal calibration. `.gitignore` excludes local secret and calibration files, but cannot protect secrets typed into tracked source: inspect your staged diff before pushing. Recordings are sent to Gemini when using voice interaction.
 
 ## Validation and limitations
 
