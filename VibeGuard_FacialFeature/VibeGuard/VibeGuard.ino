@@ -6,13 +6,11 @@
     2. changes its light when told to    http://<board-ip>/mood?m=happy
 
   The laptop runs emotion_tester.py, which watches the stream, works out the
-  mood and calls /mood. With OWN_WIFI=false, the board joins your configured
-  network. Use the IP address printed in Serial Monitor:
+  mood and calls /mood. By default the board makes its own WiFi network
+  ("MoodLight") and its address is 192.168.4.1, so connect the laptop to
+  that network and start the tester with:
 
-    python emotion_tester.py --source http://BOARD_IP:81/stream --esp http://BOARD_IP
-
-  Optional OWN_WIFI=true creates a local access point at 192.168.4.1.
-  Configure its name/password locally; the voice watch needs internet access.
+    python emotion_tester.py --source http://192.168.4.1:81/stream --esp http://192.168.4.1
 
   Arduino IDE settings (Tools menu):
     Board:            ESP32S3 Dev Module
@@ -25,6 +23,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include <DFRobotDFPlayerMini.h>
 
 // ---- network ---------------------------------------------------------------
 // true  = the board creates its own WiFi network (works anywhere, e.g. school).
@@ -33,7 +32,7 @@
 const bool OWN_WIFI = false;
 
 // Used when OWN_WIFI is true. The password must be at least 8 characters.
-const char *OWN_WIFI_NAME = "YOUR_HOTSPOT_NAME";
+const char *OWN_WIFI_NAME = "VibeGuard";
 const char *OWN_WIFI_PASSWORD = "YOUR_HOTSPOT_PASSWORD";
 
 // Used when OWN_WIFI is false.
@@ -77,6 +76,90 @@ volatile Colour target = NEUTRAL;
 Colour shown = {0, 0, 0};
 char currentMood[12] = "neutral";
 
+// ---- music (DFPlayer Mini) -------------------------------------------------
+// The music tries to move the user toward happy or neutral:
+//   mad     -> calming music
+//   sad     -> cheerful music
+//   happy   -> upbeat music that matches the mood
+//   neutral -> no music (whatever was playing stops)
+// Files on the microSD card, in a folder named "mp3":
+const int TRACK_CALM     = 1;   // mp3/0001.mp3, played when mad
+const int TRACK_CHEERFUL = 2;   // mp3/0002.mp3, played when sad
+const int TRACK_UPBEAT   = 3;   // mp3/0003.mp3, played when happy
+
+// Volume for each kind of music, 0-30. Calming music is kept softer.
+const int VOLUME_CALM     = 12;
+const int VOLUME_CHEERFUL = 18;
+const int VOLUME_UPBEAT   = 16;
+
+// Same pins as the working test sketch: ESP32 RX = 2, TX = 1.
+const int MUSIC_RX_PIN = 2;
+const int MUSIC_TX_PIN = 1;
+
+HardwareSerial musicSerial(1);
+DFRobotDFPlayerMini player;
+bool musicReady = false;
+
+// Set by the web server when the mood changes; handled in loop() so the
+// player is only ever talked to from one place.
+volatile bool musicChangePending = false;
+volatile int pendingTrack = 0;          // 0 = silence
+int playingTrack = 0;
+unsigned long trackStartedAt = 0;
+
+void startMusic() {
+  musicSerial.begin(9600, SERIAL_8N1, MUSIC_RX_PIN, MUSIC_TX_PIN);
+  delay(1000);
+  if (!player.begin(musicSerial)) {
+    Serial.println("DFPlayer not detected - check SD card, power and RX/TX. "
+                   "Camera and lights still work.");
+    return;
+  }
+  musicReady = true;
+  Serial.println("DFPlayer ready.");
+}
+
+void playTrack(int track) {
+  int volume = track == TRACK_CALM ? VOLUME_CALM
+             : track == TRACK_CHEERFUL ? VOLUME_CHEERFUL
+             : VOLUME_UPBEAT;
+  player.volume(volume);
+  delay(100);
+  player.playMp3Folder(track);
+  playingTrack = track;
+  trackStartedAt = millis();
+  Serial.printf("music -> track %d (volume %d)\n", track, volume);
+}
+
+void updateMusic() {
+  if (!musicReady) return;
+
+  if (musicChangePending) {
+    musicChangePending = false;
+    int track = pendingTrack;
+    if (track == 0) {
+      player.stop();
+      playingTrack = 0;
+      Serial.println("music -> off (neutral)");
+    } else if (track != playingTrack) {
+      playTrack(track);
+    }
+  }
+
+  // When a track ends and the mood is still the same, play it again.
+  if (player.available()) {
+    uint8_t type = player.readType();
+    int value = player.read();
+    if (type == DFPlayerPlayFinished && playingTrack != 0 &&
+        millis() - trackStartedAt > 2000) {
+      playTrack(playingTrack);
+    } else if (type == DFPlayerError) {
+      Serial.printf("DFPlayer error: %d\n", value);
+    }
+  }
+}
+// ----------------------------------------------------------------------------
+
 void showColour(Colour c) {
   uint8_t r = c.r * LED_BRIGHTNESS / 255;
   uint8_t g = c.g * LED_BRIGHTNESS / 255;
@@ -105,6 +188,17 @@ bool applyMood(const char *mood) {
   else return false;
 
   target.r = c.r; target.g = c.g; target.b = c.b;
+
+  // The laptop repeats the mood every few seconds; only a change
+  // affects the music.
+  if (strcmp(mood, currentMood) != 0) {
+    pendingTrack = strcmp(mood, "mad") == 0 ? TRACK_CALM
+                 : strcmp(mood, "sad") == 0 ? TRACK_CHEERFUL
+                 : strcmp(mood, "happy") == 0 ? TRACK_UPBEAT
+                 : 0;
+    musicChangePending = true;
+  }
+
   strlcpy(currentMood, mood, sizeof(currentMood));
   Serial.printf("mood -> %s\n", mood);
   return true;
@@ -181,9 +275,9 @@ bool startCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;         // 10 MHz: less interference with the board's WiFi
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_HVGA;     // 480x320; FRAMESIZE_VGA is sharper but heavy on a hotspot
+  config.frame_size = FRAMESIZE_QVGA;     // 320x240: half the data of 480x320
   config.jpeg_quality = 15;               // lower number = sharper, bigger frames
   config.grab_mode = CAMERA_GRAB_LATEST;  // always send the newest frame
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -234,6 +328,7 @@ void setup() {
   showColour({40, 0, 40});   // purple = starting up
 
   bool cameraOk = startCamera();
+  startMusic();
 
   String ip;
   if (OWN_WIFI) {
@@ -274,5 +369,6 @@ void loop() {
     shown.b = stepToward(shown.b, t.b);
     showColour(shown);
   }
+  updateMusic();
   delay(FADE_STEP_MS);
 }

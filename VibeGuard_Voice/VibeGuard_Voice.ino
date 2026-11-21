@@ -12,7 +12,6 @@
 
   The watch needs a WiFi network WITH internet (for Gemini), so use the same
   hotspot or home network as the laptop and the camera board.
-  API KEY: [REMOVED: configure locally]
 */
 #define ARDUINOJSON_STRING_LENGTH_SIZE 4
 #include <ArduinoJson.h>
@@ -37,6 +36,8 @@
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
+
+#include "vg_fonts.h"   // smooth fonts, made by make_fonts.py
 // ENTER YOUR DETAILS HER
 
 const char *WIFI_SSID = "YOUR_WIFI_NAME";
@@ -58,30 +59,35 @@ constexpr int MIC_CHANNEL = 0;
 
 constexpr size_t MAX_SAMPLES = 16000 * 8;
 
-// Colours (16-bit). Each mood has a bright accent and a dark core.
+// Colours. VG_RGB(r, g, b) turns normal 0-255 red, green, blue into the screen's format.
+#define VG_RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+
 constexpr uint16_t BLACK = 0x0000;
 constexpr uint16_t WHITE = 0xFFFF;
-constexpr uint16_t DIM = 0x0294;        // faint teal for guide lines
-constexpr uint16_t CYAN = 0x07FF;       // neutral
-constexpr uint16_t GOLD = 0xFE60;       // happy
-constexpr uint16_t BLUE = 0x5D1F;       // sad
-constexpr uint16_t RED = 0xF9A6;        // mad
-constexpr uint16_t CORE_CYAN = 0x0127;
-constexpr uint16_t CORE_GOLD = 0x3180;
-constexpr uint16_t CORE_BLUE = 0x0869;
-constexpr uint16_t CORE_RED = 0x3021;
+constexpr uint16_t DIM = VG_RGB(120, 120, 135);      // hints and secondary text
+constexpr uint16_t CYAN = VG_RGB(0, 255, 255);       // status page headings
+constexpr uint16_t LOGO_PURPLE = VG_RGB(170, 90, 255);
+constexpr uint16_t LOGO_PINK = VG_RGB(255, 90, 200);
 
-// Home screen layout.
-constexpr int HUD_X = 205;              // centre of the rings
-constexpr int HUD_Y = 238;
-constexpr int RING_INNER = 98;
-constexpr int RING_OUTER = 107;
-constexpr int RING_SEGMENT = 320;       // 80 degrees, in quarter degrees
-constexpr int RING_STEP = 12;           // 3 degrees per frame
-constexpr unsigned long RING_FRAME_MS = 90;   // lower = spins faster
-constexpr unsigned long PULSE_MS = 800;
-constexpr int BUTTON_X = 335;
-constexpr int BUTTON_Y = 440;
+// One colour per mood, as in the design.
+constexpr uint16_t HAPPY_COLOUR = VG_RGB(255, 150, 30);    // orange
+constexpr uint16_t NEUTRAL_COLOUR = VG_RGB(225, 228, 240); // silver
+constexpr uint16_t SAD_COLOUR = VG_RGB(40, 140, 255);      // blue
+constexpr uint16_t MAD_COLOUR = VG_RGB(255, 45, 45);       // red
+
+// Screen layout (410 x 502).
+constexpr int FACE_X = 205;             // centre of the face
+constexpr int FACE_Y = 196;
+constexpr int FACE_R = 60;
+constexpr int WAVE_TOP = 418;           // the glowing wave fills below this
+constexpr int BUTTON_X = 324;           // round button, bottom right
+constexpr int BUTTON_Y = 464;
+constexpr int MIC_X = 86;               // microphone icon, bottom left
+constexpr int MIC_Y = 464;
+
+// Animation speed on the home screen.
+constexpr unsigned long WAVE_FRAME_MS = 120;  // lower = wave moves faster
+constexpr unsigned long PULSE_MS = 160;       // glow breathing frame
 
 // How long an error stays up before the watch goes back home.
 constexpr unsigned long ERROR_SHOW_MS = 6000;
@@ -92,10 +98,14 @@ const char *WATCH_NAME = "vibeguard-watch";
 
 // The mood must last this long before the watch asks about it,
 // so a passing expression does not trigger a question.
-constexpr unsigned long CHECK_IN_AFTER_MS = 4000;
+// (The laptop already waits 3 s before reporting a new mood.)
+constexpr unsigned long CHECK_IN_AFTER_MS = 5000;
 
-// Minimum time between two questions.
-constexpr unsigned long CHECK_IN_COOLDOWN_MS = 60000;
+// Still sad or mad after a check-in: ask again after this long.
+constexpr unsigned long CHECK_IN_REPEAT_MS = 120000;
+
+// Minimum time between any two questions, even if the mood changes.
+constexpr unsigned long CHECK_IN_COOLDOWN_MS = 45000;
 
 // How long the watch waits for a reply before going back home.
 constexpr unsigned long ANSWER_WAIT_MS = 30000;
@@ -114,9 +124,13 @@ Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   12, 11, 4, 5, 6, 7
 );
 
-Arduino_GFX *gfx = new Arduino_CO5300(
+Arduino_GFX *display = new Arduino_CO5300(
   bus, 8, 0, 410, 502, 22, 0, 0, 0
 );
+
+// Everything is drawn into this full-screen picture first, then sent to
+// the screen in one go: smooth edges and no flicker.
+Arduino_Canvas *gfx = new Arduino_Canvas(410, 502, display);
 
 I2SClass audio;
 audio_driver::ES7210 microphone;
@@ -135,9 +149,10 @@ bool serverStarted = false;
 
 unsigned long releaseTime = 0;
 unsigned long statusTime = 0;
-unsigned long ringTime = 0;
+unsigned long waveTime = 0;
 unsigned long pulseTime = 0;
-int ringPos = 0;                 // ring rotation, in quarter degrees
+unsigned long statusBarTime = 0;
+float wavePhase = 0;             // moves the bottom wave along
 
 String lastError;
 
@@ -219,206 +234,578 @@ bool apiCall(
 );
 void showHome();
 bool speakAnswer(const String &answer);
-// SCREEN DESIG
+// SCREEN DESIGN
+//
+// Everything is drawn into a full-screen picture in memory (fb), with
+// smooth (anti-aliased) edges, then sent to the screen in one go.
+// Text uses the smooth fonts in vg_fonts.h.
 
-void drawText(
-  int x, int y,
-  const String &message,
-  int size,
-  uint16_t color
-) {
-  gfx->setCursor(x, y);
-  gfx->setTextSize(size);
-  gfx->setTextColor(color);
-  gfx->print(message);
-}
+uint16_t *fb = nullptr;          // the picture in memory
+uint16_t *flushBuf = nullptr;    // used to send part of the screen
+constexpr int SCREEN_W = 410;
+constexpr int SCREEN_H = 502;
 
-// Text is 6 x 8 pixels per character, times the size.
-void drawCentered(
-  int centerX, int y,
-  const String &message,
-  int size,
-  uint16_t color
-) {
-  drawText(
-    centerX - (int)message.length() * 3 * size,
-    y, message, size, color
-  );
-}
+// Declarations with default values (the "alpha" strength is 1 = solid).
+void aaDisc(float cx, float cy, float r, uint16_t c, float alpha = 1);
+void aaRing(float cx, float cy, float r, float w, uint16_t c, float alpha = 1);
+void aaArc(float cx, float cy, float r, float w, float a0, float a1,
+           uint16_t c, float alpha = 1);
+void aaLine(float x0, float y0, float x1, float y1, float w, uint16_t c,
+            float alpha = 1);
+void aaRoundBox(float cx, float cy, float hw, float hh, float r, float w,
+                uint16_t c, float alpha = 1);
+void drawTextAA(const VGFont &f, int x, int y, const String &s,
+                uint16_t c, float alpha = 1);
+void drawTextCentered(const VGFont &f, int cx, int y, const String &s,
+                      uint16_t c, float alpha = 1);
+int drawWrappedAA(const VGFont &f, const String &message, int x, int y,
+                  int maxWidth, int lastBaseline, int lineGap, uint16_t c,
+                  bool centred = false);
+// ---- Colours for the current mood ----------------------------
 
-// The whole interface takes its accent colour from the mood.
 uint16_t moodAccent() {
-  if (currentMood == "happy") return GOLD;
-  if (currentMood == "sad") return BLUE;
-  if (currentMood == "mad") return RED;
-  return CYAN;
+  if (currentMood == "happy") return HAPPY_COLOUR;
+  if (currentMood == "sad") return SAD_COLOUR;
+  if (currentMood == "mad") return MAD_COLOUR;
+  return NEUTRAL_COLOUR;
 }
 
-uint16_t moodCore() {
-  if (currentMood == "happy") return CORE_GOLD;
-  if (currentMood == "sad") return CORE_BLUE;
-  if (currentMood == "mad") return CORE_RED;
-  return CORE_CYAN;
+String moodLabel() {
+  if (currentMood == "happy") return "Happy";
+  if (currentMood == "sad") return "Sad";
+  if (currentMood == "mad") return "Mad";
+  return "Neutral";
 }
 
-// Small header used on every screen.
-void drawHeader() {
-  uint16_t accent = moodAccent();
-
-  drawCentered(205, 30, "VIBEGUARD", 3, accent);
-  drawCentered(205, 62, "THERAPY AI", 2, DIM);
-
-  gfx->drawFastHLine(40, 90, 110, DIM);
-  gfx->drawFastHLine(260, 90, 110, DIM);
-  gfx->fillRect(150, 89, 110, 3, accent);
+// Same colour, darker. f = 0 is black, f = 1 is unchanged.
+uint16_t scaleColour(uint16_t c, float f) {
+  if (f <= 0) return BLACK;
+  if (f > 1) f = 1;
+  int r = ((c >> 11) & 31) * f;
+  int g = ((c >> 5) & 63) * f;
+  int b = (c & 31) * f;
+  return (r << 11) | (g << 5) | b;
 }
 
-// Round button, bottom right: "i" on home, "<" on the status page.
-void drawCircleButton() {
-  uint16_t accent = moodAccent();
-
-  gfx->fillCircle(BUTTON_X, BUTTON_Y, 30, BLACK);
-  gfx->drawCircle(BUTTON_X, BUTTON_Y, 30, accent);
-  gfx->drawCircle(BUTTON_X, BUTTON_Y, 29, accent);
-  gfx->drawCircle(BUTTON_X, BUTTON_Y, 24, DIM);
-
-  drawCentered(
-    BUTTON_X + 1, BUTTON_Y - 11,
-    statusPage ? "<" : "i", 3, accent
-  );
+// Mix two colours. a = 0 gives bg, a = 32 gives fg.
+static inline uint16_t mixColour(uint16_t bg, uint16_t fg, uint32_t a) {
+  uint32_t f = (fg | ((uint32_t)fg << 16)) & 0x07E0F81F;
+  uint32_t b = (bg | ((uint32_t)bg << 16)) & 0x07E0F81F;
+  b += ((f - b) * a) >> 5;
+  b &= 0x07E0F81F;
+  return (uint16_t)(b | (b >> 16));
 }
 
-// ---- The rotating ring -------------------------------------
-// Angles are counted in quarter degrees (1440 per turn) so the
-// exact same lines can be drawn and later erased.
+static inline float clamp01(float v) {
+  return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
 
-void ringLines(int from, int count, uint16_t color) {
-  for (int i = 0; i < count; i++) {
-    int unit = (from + i) % 1440;
-    float angle = unit * (PI / 720.0f);
-    float c = cosf(angle);
-    float s = sinf(angle);
+// Paint one pixel with a colour at a given strength (0 to 1).
+static inline void blendPixel(int x, int y, uint16_t c, float a) {
+  if (a <= 0.01f || x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H) return;
+  uint16_t &p = fb[y * SCREEN_W + x];
+  p = a >= 0.99f ? c : mixColour(p, c, (uint32_t)(a * 32 + 0.5f));
+}
 
-    gfx->drawLine(
-      HUD_X + lroundf(RING_INNER * c),
-      HUD_Y + lroundf(RING_INNER * s),
-      HUD_X + lroundf(RING_OUTER * c),
-      HUD_Y + lroundf(RING_OUTER * s),
-      color
-    );
+void clearArea(int x, int y, int w, int h) {
+  for (int row = max(0, y); row < min(SCREEN_H, y + h); row++) {
+    for (int col = max(0, x); col < min(SCREEN_W, x + w); col++) {
+      fb[row * SCREEN_W + col] = BLACK;
+    }
   }
 }
 
-// Three bright segments with gaps between them.
-void drawRing(uint16_t color) {
-  for (int k = 0; k < 3; k++) {
-    ringLines(ringPos + k * 480, RING_SEGMENT, color);
+// Send the whole picture to the screen.
+void flushAll() {
+  gfx->flush(true);
+}
+
+// Send just one rectangle of the picture to the screen (faster).
+void flushArea(int x, int y, int w, int h) {
+  x = max(0, x) & ~1;                // the screen wants even edges
+  y = max(0, y) & ~1;
+  w = min(SCREEN_W - x, (w + 3) & ~1);
+  h = min(SCREEN_H - y, (h + 3) & ~1);
+  if (w <= 0 || h <= 0) return;
+
+  for (int row = 0; row < h; row++) {
+    memcpy(flushBuf + row * w, fb + (y + row) * SCREEN_W + x, w * 2);
+  }
+  display->draw16bitRGBBitmap(x, y, flushBuf, w, h);
+}
+
+// ---- Smooth shapes ------------------------------------------------
+
+// Filled circle.
+void aaDisc(float cx, float cy, float r, uint16_t c, float alpha) {
+  for (int y = floorf(cy - r - 1); y <= ceilf(cy + r + 1); y++) {
+    for (int x = floorf(cx - r - 1); x <= ceilf(cx + r + 1); x++) {
+      float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
+      blendPixel(x, y, c, clamp01(r - d + 0.5f) * alpha);
+    }
   }
 }
 
-// Turn the ring a little: erase the tail, extend the head.
-void stepRing() {
-  uint16_t accent = moodAccent();
+// Circle outline of width w.
+void aaRing(float cx, float cy, float r, float w, uint16_t c,
+            float alpha) {
+  float out = r + w;
+  for (int y = floorf(cy - out); y <= ceilf(cy + out); y++) {
+    for (int x = floorf(cx - out); x <= ceilf(cx + out); x++) {
+      float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
+      blendPixel(x, y, c, clamp01(w * 0.5f - fabsf(d - r) + 0.5f) * alpha);
+    }
+  }
+}
 
-  for (int k = 0; k < 3; k++) {
-    ringLines(ringPos + k * 480, RING_STEP, BLACK);
-    ringLines(
-      ringPos + k * 480 + RING_SEGMENT, RING_STEP, accent
-    );
+// Part of a circle with rounded ends. Angles in degrees:
+// 0 = right, 90 = down, 270 = up.
+void aaArc(float cx, float cy, float r, float w, float a0, float a1,
+           uint16_t c, float alpha) {
+  const float rad = PI / 180.0f;
+  float e0x = cx + r * cosf(a0 * rad), e0y = cy + r * sinf(a0 * rad);
+  float e1x = cx + r * cosf(a1 * rad), e1y = cy + r * sinf(a1 * rad);
+  float out = r + w;
+
+  for (int y = floorf(cy - out); y <= ceilf(cy + out); y++) {
+    for (int x = floorf(cx - out); x <= ceilf(cx + out); x++) {
+      float dx = x - cx, dy = y - cy;
+      float d = sqrtf(dx * dx + dy * dy);
+      if (fabsf(d - r) > w) continue;
+
+      float a = atan2f(dy, dx) / rad;
+      while (a < a0) a += 360;
+      while (a >= a0 + 360) a -= 360;
+
+      float dist;
+      if (a <= a1) {
+        dist = fabsf(d - r);
+      } else {
+        float d0 = sqrtf((x - e0x) * (x - e0x) + (y - e0y) * (y - e0y));
+        float d1 = sqrtf((x - e1x) * (x - e1x) + (y - e1y) * (y - e1y));
+        dist = min(d0, d1);
+      }
+      blendPixel(x, y, c, clamp01(w * 0.5f - dist + 0.5f) * alpha);
+    }
+  }
+}
+
+// Straight line with rounded ends.
+void aaLine(float x0, float y0, float x1, float y1, float w, uint16_t c,
+            float alpha) {
+  float vx = x1 - x0, vy = y1 - y0;
+  float len2 = vx * vx + vy * vy;
+  if (len2 < 0.0001f) len2 = 0.0001f;
+
+  for (int y = floorf(min(y0, y1) - w); y <= ceilf(max(y0, y1) + w); y++) {
+    for (int x = floorf(min(x0, x1) - w); x <= ceilf(max(x0, x1) + w); x++) {
+      float t = clamp01(((x - x0) * vx + (y - y0) * vy) / len2);
+      float px = x0 + t * vx - x, py = y0 + t * vy - y;
+      float dist = sqrtf(px * px + py * py);
+      blendPixel(x, y, c, clamp01(w * 0.5f - dist + 0.5f) * alpha);
+    }
+  }
+}
+
+// Distance to a rounded rectangle (negative inside).
+static inline float roundBoxDistance(float px, float py, float hw, float hh,
+                                     float r) {
+  float qx = fabsf(px) - hw + r, qy = fabsf(py) - hh + r;
+  float ox = max(qx, 0.0f), oy = max(qy, 0.0f);
+  return sqrtf(ox * ox + oy * oy) + min(max(qx, qy), 0.0f) - r;
+}
+
+// Rounded rectangle, filled (w = 0) or as an outline of width w.
+void aaRoundBox(float cx, float cy, float hw, float hh, float r, float w,
+                uint16_t c, float alpha) {
+  for (int y = floorf(cy - hh - w - 1); y <= ceilf(cy + hh + w + 1); y++) {
+    for (int x = floorf(cx - hw - w - 1); x <= ceilf(cx + hw + w + 1); x++) {
+      float sd = roundBoxDistance(x - cx, y - cy, hw, hh, r);
+      float cov = w > 0 ? clamp01(w * 0.5f - fabsf(sd) + 0.5f)
+                        : clamp01(0.5f - sd);
+      blendPixel(x, y, c, cov * alpha);
+    }
+  }
+}
+
+// Soft light around a circle of radius r.
+void aaGlow(float cx, float cy, float r, float strength, uint16_t c) {
+  const float reach = 30;
+  for (int y = floorf(cy - r - reach); y <= ceilf(cy + r + reach); y++) {
+    for (int x = floorf(cx - r - reach); x <= ceilf(cx + r + reach); x++) {
+      float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - r;
+      if (d < 0 || d > reach) continue;
+      blendPixel(x, y, c, strength * expf(-d / 8.0f));
+    }
+  }
+}
+
+// ---- Smooth text ----------------------------------------------------
+
+int textWidth(const VGFont &f, const String &s) {
+  int w = 0;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char ch = s[i];
+    if (ch < 32 || ch > 126) ch = '?';
+    w += f.glyphs[ch - 32].advance;
+  }
+  return w;
+}
+
+// Draws text with its baseline at y.
+void drawTextAA(const VGFont &f, int x, int y, const String &s,
+                uint16_t c, float alpha) {
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char ch = s[i];
+    if (ch < 32 || ch > 126) ch = '?';
+    const VGGlyph &g = f.glyphs[ch - 32];
+
+    for (int row = 0; row < g.height; row++) {
+      for (int col = 0; col < g.width; col++) {
+        int idx = row * g.width + col;
+        uint8_t b = f.bitmap[g.offset + idx / 2];
+        uint8_t shade = (idx & 1) ? (b & 15) : (b >> 4);
+        if (shade) {
+          blendPixel(x + g.xOffset + col, y + g.yOffset + row, c,
+                     shade / 15.0f * alpha);
+        }
+      }
+    }
+    x += g.advance;
+  }
+}
+
+void drawTextCentered(const VGFont &f, int cx, int y, const String &s,
+                      uint16_t c, float alpha) {
+  drawTextAA(f, cx - textWidth(f, s) / 2, y, s, c, alpha);
+}
+
+// Wraps text at whole words within maxWidth. Returns the next baseline.
+int drawWrappedAA(const VGFont &f, const String &message, int x, int y,
+                  int maxWidth, int lastBaseline, int lineGap, uint16_t c,
+                  bool centred) {
+  String line;
+  unsigned int i = 0;
+
+  while (i <= message.length() && y <= lastBaseline) {
+    int next = message.indexOf(' ', i);
+    if (next < 0) next = message.length();
+    String word = message.substring(i, next);
+    String trial = line.length() ? line + " " + word : word;
+
+    if (line.length() && textWidth(f, trial) > maxWidth) {
+      if (centred) drawTextCentered(f, x + maxWidth / 2, y, line, c);
+      else drawTextAA(f, x, y, line, c);
+      y += lineGap;
+      line = word;
+    } else {
+      line = trial;
+    }
+    i = next + 1;
   }
 
-  ringPos = (ringPos + RING_STEP) % 1440;
+  if (line.length() && y <= lastBaseline) {
+    if (centred) drawTextCentered(f, x + maxWidth / 2, y, line, c);
+    else drawTextAA(f, x, y, line, c);
+    y += lineGap;
+  }
+  return y;
 }
 
-void drawCoreOutline(bool bright) {
-  uint16_t color = bright ? WHITE : moodAccent();
+// ---- Top of the screen: clock, Wi-Fi, battery and logo ----------
 
-  gfx->drawCircle(HUD_X, HUD_Y, 66, color);
-  gfx->drawCircle(HUD_X, HUD_Y, 67, color);
-}
+constexpr int STATUS_H = 48;
 
-void drawCorner(int x, int y, int dx, int dy) {
-  gfx->drawFastHLine(dx > 0 ? x : x - 26, y, 26, DIM);
-  gfx->drawFastVLine(x, dy > 0 ? y : y - 26, 26, DIM);
-}
+void renderStatusBar() {
+  // Clock (shows --:-- until the time is known).
+  String clock = "--:--";
+  struct tm now;
 
-void showHome() {
-  statusPage = false;
-  homeVisible = true;
+  if (time(nullptr) > 1700000000 && getLocalTime(&now, 0)) {
+    char text[8];
+    strftime(text, sizeof(text), "%I:%M", &now);
+    clock = text[0] == '0' ? String(text + 1) : String(text);
+  }
+  drawTextAA(FONT_SMALL, 70, 36, clock, WHITE);
 
-  uint16_t accent = moodAccent();
-
-  gfx->fillScreen(BLACK);
-  drawHeader();
-
-  // Frame corners around the display core.
-  drawCorner(40, 108, 1, 1);
-  drawCorner(370, 108, -1, 1);
-  drawCorner(40, 368, 1, -1);
-  drawCorner(370, 368, -1, -1);
-
-  // Outer scale: a thin circle with tick marks.
-  gfx->drawCircle(HUD_X, HUD_Y, 118, DIM);
-
-  for (int tick = 0; tick < 24; tick++) {
-    float angle = tick * (PI / 12.0f);
-    int inner = (tick % 6 == 0) ? 120 : 123;
-
-    gfx->drawLine(
-      HUD_X + lroundf(inner * cosf(angle)),
-      HUD_Y + lroundf(inner * sinf(angle)),
-      HUD_X + lroundf(129 * cosf(angle)),
-      HUD_Y + lroundf(129 * sinf(angle)),
-      (tick % 6 == 0) ? accent : DIM
-    );
+  // Wi-Fi symbol, faded when disconnected.
+  float on = WiFi.status() == WL_CONNECTED ? 1.0f : 0.35f;
+  aaDisc(300, 35, 2.2f, WHITE, on);
+  for (int r = 6; r <= 14; r += 4) {
+    aaArc(300, 35, r, 2.2f, 228, 312, WHITE, on);
   }
 
-  // Rotating ring, then the inner guide circle.
-  drawRing(accent);
-  gfx->drawCircle(HUD_X, HUD_Y, 86, DIM);
-
-  // Glowing core with the current mood in the middle.
-  gfx->fillCircle(HUD_X, HUD_Y, 72, BLACK);
-  gfx->fillCircle(HUD_X, HUD_Y, 65, moodCore());
-  drawCoreOutline(false);
-
-  String mood = currentMood;
-  mood.toUpperCase();
-
-  drawCentered(HUD_X, HUD_Y - 30, "MOOD", 2, DIM);
-  drawCentered(
-    HUD_X, HUD_Y - 6, mood,
-    mood.length() > 5 ? 2 : 3, accent
-  );
-
-  drawCentered(205, 384, "HOLD BUTTON TO TALK", 2, WHITE);
-
-  // Bottom left: who is wearing it, power and connection.
-  drawText(40, 418, "PINA", 3, WHITE);
-
-  String power_line = "PWR USB";
+  // Battery symbol.
+  aaRoundBox(330, 29, 12, 6.5f, 3, 1.8f, WHITE);
+  aaRoundBox(345, 29, 1.2f, 2.5f, 1, 0, WHITE);
 
   if (powerReady && power.isBatteryConnect()) {
     int percent = power.getBatteryPercent();
-
     if (percent >= 0 && percent <= 100) {
-      power_line = "PWR " + String(percent) + "%";
+      float fill = 9.5f * percent / 100.0f;
+      if (fill > 0.5f) {
+        aaRoundBox(320.5f + fill, 29, fill, 4, 1.5f, 0,
+                   percent < 20 ? MAD_COLOUR : WHITE);
+      }
+    }
+  }
+}
+
+void renderLogo() {
+  // Heartbeat line in purple to pink, then the name.
+  const float xs[] = {0, 10, 15, 22, 29, 34, 44};
+  const float ys[] = {0, 0, -12, 12, -6, 0, 0};
+  int titleW = textWidth(FONT_TITLE, "VibeGuard");
+  int startX = SCREEN_W / 2 - (44 + 10 + titleW) / 2;
+  int baseY = 84;
+
+  for (int i = 0; i < 6; i++) {
+    uint16_t c = mixColour(LOGO_PURPLE, LOGO_PINK, i * 32 / 5);
+    aaLine(startX + xs[i], baseY - 12 + ys[i],
+           startX + xs[i + 1], baseY - 12 + ys[i + 1], 3.5f, c);
+  }
+
+  drawTextAA(FONT_TITLE, startX + 54, baseY, "VibeGuard", WHITE);
+}
+
+void renderHeader() {
+  renderStatusBar();
+  renderLogo();
+}
+
+// ---- The face ---------------------------------------------------
+
+enum FaceState { FACE_IDLE, FACE_LISTENING, FACE_THINKING, FACE_SPEAKING };
+
+constexpr int FACE_BOX = 92;     // half-size of the area the face uses
+
+void renderFace(int state, float glow) {
+  uint16_t a = moodAccent();
+  uint16_t dark = scaleColour(a, 0.10f);
+
+  aaGlow(FACE_X, FACE_Y, FACE_R + 1, glow, a);
+  aaDisc(FACE_X, FACE_Y, FACE_R, dark);
+  aaRing(FACE_X, FACE_Y, FACE_R - 2.5f, 5.5f, a);
+
+  float ey = FACE_Y - 12;
+
+  // Eyes: happy ones are curved, the others are round.
+  if (currentMood == "happy") {
+    aaArc(FACE_X - 22, ey + 5, 10, 4.5f, 200, 340, a);
+    aaArc(FACE_X + 22, ey + 5, 10, 4.5f, 200, 340, a);
+  } else {
+    aaDisc(FACE_X - 22, ey, 6.5f, a);
+    aaDisc(FACE_X + 22, ey, 6.5f, a);
+  }
+
+  // Eyebrows: worried for sad, angry for mad.
+  if (currentMood == "sad") {
+    aaLine(FACE_X - 36, ey - 13, FACE_X - 14, ey - 21, 4, a);
+    aaLine(FACE_X + 14, ey - 21, FACE_X + 36, ey - 13, 4, a);
+  } else if (currentMood == "mad") {
+    aaLine(FACE_X - 36, ey - 22, FACE_X - 12, ey - 13, 4.5f, a);
+    aaLine(FACE_X + 12, ey - 13, FACE_X + 36, ey - 22, 4.5f, a);
+  }
+
+  // Mouth. While speaking it is open.
+  float my = FACE_Y + 20;
+
+  if (state == FACE_SPEAKING) {
+    if (currentMood == "happy") {
+      // Open smile: the lower half of a circle.
+      float cy = my - 6, r = 17;
+      for (int y = cy; y <= cy + r + 1; y++) {
+        for (int x = FACE_X - r - 1; x <= FACE_X + r + 1; x++) {
+          float d = sqrtf((x - FACE_X) * (x - FACE_X) + (y - cy) * (y - cy));
+          blendPixel(x, y, a, min(clamp01(r - d + 0.5f),
+                                  clamp01(y - cy + 0.5f)));
+        }
+      }
+      aaDisc(FACE_X, my + 6, 6, scaleColour(a, 0.45f));
+    } else {
+      aaRoundBox(FACE_X, my + 3, 12, 9, 8, 0, a);
+      aaRoundBox(FACE_X, my + 5, 6, 4, 3.5f, 0, scaleColour(a, 0.35f));
+    }
+  } else if (currentMood == "happy") {
+    aaArc(FACE_X, my - 12, 24, 5, 25, 155, a);
+  } else if (currentMood == "neutral") {
+    aaLine(FACE_X - 18, my, FACE_X + 18, my, 5, a);
+  } else if (currentMood == "sad") {
+    aaArc(FACE_X, my + 22, 22, 5, 210, 330, a);
+  } else {
+    aaArc(FACE_X, my + 24, 22, 5, 215, 325, a);
+  }
+}
+
+// The "(( ))" sound waves beside the face.
+void renderSoundArcs(bool left, bool right) {
+  uint16_t a = moodAccent();
+
+  for (int k = 0; k < 2; k++) {
+    float r = FACE_R + 18 + k * 13;
+    float alpha = k ? 0.5f : 1.0f;
+    if (right) aaArc(FACE_X, FACE_Y, r, 4.5f, -32, 32, a, alpha);
+    if (left) aaArc(FACE_X, FACE_Y, r, 4.5f, 148, 212, a, alpha);
+  }
+}
+
+// ---- The glowing wave at the bottom ------------------------------
+
+void renderWave(int x0, int x1) {
+  uint16_t a = moodAccent();
+
+  for (int x = max(0, x0); x <= min(SCREEN_W - 1, x1); x++) {
+    float wy = 446 + 9 * sinf(x * 0.022f + wavePhase)
+                   + 5 * sinf(x * 0.051f - wavePhase * 1.3f);
+
+    for (int y = WAVE_TOP; y < SCREEN_H; y++) {
+      float t = y - wy;
+      float line = clamp01(1.6f - fabsf(t));
+      float body = t > 0 ? 0.45f * expf(-t / 18.0f) + 0.10f : 0;
+      float halo = t < 0 ? 0.35f * expf(t / 4.0f) : 0;
+      float v = max(line, max(body, halo));
+
+      uint16_t c = scaleColour(a, v);
+      if (line > 0) c = mixColour(c, WHITE, (uint32_t)(line * 10));
+      fb[y * SCREEN_W + x] = c;
+    }
+  }
+}
+
+void renderMicIcon() {
+  aaDisc(MIC_X, MIC_Y, 18, BLACK, 0.55f);
+  aaRing(MIC_X, MIC_Y, 18, 1.8f, WHITE, 0.9f);
+  aaLine(MIC_X, MIC_Y - 9, MIC_X, MIC_Y - 2, 7, WHITE);
+  aaArc(MIC_X, MIC_Y - 4, 8.5f, 1.8f, 15, 165, WHITE);
+  aaLine(MIC_X, MIC_Y + 5, MIC_X, MIC_Y + 9, 1.8f, WHITE);
+}
+
+// Round button, bottom right: a chat bubble opens the status page,
+// "<" goes back.
+void renderButton() {
+  aaDisc(BUTTON_X, BUTTON_Y, 18, BLACK, 0.55f);
+  aaRing(BUTTON_X, BUTTON_Y, 18, 1.8f, WHITE, 0.9f);
+
+  if (statusPage) {
+    aaLine(BUTTON_X + 3, BUTTON_Y - 7, BUTTON_X - 4, BUTTON_Y, 2.5f, WHITE);
+    aaLine(BUTTON_X - 4, BUTTON_Y, BUTTON_X + 3, BUTTON_Y + 7, 2.5f, WHITE);
+  } else {
+    aaRoundBox(BUTTON_X, BUTTON_Y - 2, 9, 6.5f, 4, 1.8f, WHITE);
+    aaLine(BUTTON_X - 4, BUTTON_Y + 4.5f, BUTTON_X - 7, BUTTON_Y + 9,
+           1.8f, WHITE);
+  }
+}
+
+// Sound bars in the middle of the wave. level: 0 (quiet) to 1000 (loud).
+void drawBars(int level) {
+  const int count = 17, gap = 10, x0 = 125, cy = 462;
+  uint16_t a = moodAccent();
+
+  renderWave(x0 - 8, x0 + count * gap);
+  level = constrain(level, 0, 1000);
+
+  for (int i = 0; i < count; i++) {
+    float shape = 1.0f - fabsf(i - (count - 1) / 2.0f) / (count / 2.0f);
+    float wobble = 0.6f + random(40) / 100.0f;
+    float h = 3 + shape * level / 1000.0f * 40 * wobble;
+    uint16_t c = i % 2 ? mixColour(a, WHITE, 12) : a;
+    aaLine(x0 + i * gap, cy - h / 2, x0 + i * gap, cy + h / 2, 4, c);
+  }
+
+  flushArea(x0 - 8, WAVE_TOP, count * gap + 16, SCREEN_H - WAVE_TOP);
+}
+
+// ---- Whole screens -------------------------------------------------
+
+// The face screen used for idle, listening, thinking and speaking.
+void showFaceScreen(
+  int state, const String &label, const String &caption
+) {
+  homeVisible = false;
+  statusPage = false;
+
+  clearArea(0, 0, SCREEN_W, SCREEN_H);
+  renderHeader();
+  renderFace(state, 0.45f);
+
+  if (state == FACE_LISTENING) renderSoundArcs(true, true);
+  if (state == FACE_SPEAKING) renderSoundArcs(false, true);
+
+  int ly = FACE_Y + FACE_R + 58;
+
+  if (state == FACE_THINKING) {
+    for (int i = -1; i <= 1; i++) {
+      aaDisc(FACE_X + i * 15, ly - 34, 4.5f, moodAccent());
     }
   }
 
-  power_line +=
-    WiFi.status() == WL_CONNECTED ? "  LINK OK" : "  NO LINK";
+  drawTextCentered(FONT_LABEL, SCREEN_W / 2, ly, label,
+                   state == FACE_IDLE ? moodAccent() : WHITE);
 
-  drawText(40, 452, power_line, 2, DIM);
+  if (caption.length()) {
+    drawWrappedAA(FONT_TEXT, caption, 40, ly + 36, SCREEN_W - 80,
+                  WAVE_TOP - 6, 26, mixColour(BLACK, WHITE, 24), true);
+  }
 
-  drawCircleButton();
-
-  ringTime = millis();
-  pulseTime = millis();
-  pulseOn = false;
+  renderWave(0, SCREEN_W - 1);
+  renderMicIcon();
+  renderButton();
+  flushAll();
 }
 
-// Shows a heading and a block of text, wrapped at whole words.
+void showHome() {
+  showFaceScreen(FACE_IDLE, moodLabel(), "Hold the button to talk");
+  homeVisible = true;
+  waveTime = millis();
+  pulseTime = millis();
+}
+
+void showListening() {
+  showFaceScreen(
+    FACE_LISTENING, "Listening...", "Release the button to send."
+  );
+}
+
+void showThinking() {
+  showFaceScreen(FACE_THINKING, "Thinking...", "");
+}
+
+void showSpeaking(const String &text) {
+  showFaceScreen(FACE_SPEAKING, "Speaking...", text);
+}
+
+// Home screen animation: moving wave and a slowly breathing glow.
+void animateHome() {
+  unsigned long now = millis();
+
+  if (now - waveTime >= WAVE_FRAME_MS) {
+    wavePhase += 0.12f;
+    renderWave(0, SCREEN_W - 1);
+    renderMicIcon();
+    renderButton();
+    flushArea(0, WAVE_TOP, SCREEN_W, SCREEN_H - WAVE_TOP);
+    waveTime = now;
+  }
+
+  if (now - pulseTime >= PULSE_MS) {
+    float glow = 0.42f + 0.18f * sinf(now / 900.0f);
+    clearArea(FACE_X - FACE_BOX, FACE_Y - FACE_BOX, FACE_BOX * 2,
+              FACE_BOX * 2);
+    renderFace(FACE_IDLE, glow);
+    flushArea(FACE_X - FACE_BOX, FACE_Y - FACE_BOX, FACE_BOX * 2,
+              FACE_BOX * 2);
+    pulseTime = now;
+  }
+
+  if (now - statusBarTime >= 20000) {
+    clearArea(0, 0, SCREEN_W, STATUS_H);
+    renderStatusBar();
+    flushArea(0, 0, SCREEN_W, STATUS_H);
+    statusBarTime = now;
+  }
+}
+
+// Text screens: questions, answers, errors.
 void showMessage(
   const String &heading,
   const String &message
@@ -426,53 +813,79 @@ void showMessage(
   homeVisible = false;
   statusPage = false;
 
-  gfx->fillScreen(BLACK);
-  drawHeader();
+  clearArea(0, 0, SCREEN_W, SCREEN_H);
+  renderHeader();
 
-  gfx->fillRect(30, 122, 4, 26, moodAccent());
-  drawText(44, 124, heading, 3, moodAccent());
+  uint16_t a = moodAccent();
+  aaRoundBox(40, 136, 2, 15, 2, 0, a);
+  drawTextAA(FONT_LABEL, 54, 148, heading, a);
 
-  const unsigned int perLine = 28;
-  int y = 178;
-  unsigned int start = 0;
-
-  while (start < message.length() && y < 400) {
-    unsigned int end = start + perLine;
-
-    if (end >= message.length()) {
-      end = message.length();
-    } else {
-      // Step back to the last space so words are not cut.
-      int space = message.lastIndexOf(' ', end);
-
-      if (space > (int)start) end = space;
-    }
-
-    String line = message.substring(start, end);
-    line.trim();
-
-    drawText(32, y, line, 2, WHITE);
-    y += 24;
-
-    start = end;
-
-    while (
-      start < message.length() && message[start] == ' '
-    ) {
-      start++;
-    }
-  }
+  drawWrappedAA(FONT_TEXT, message, 40, 196, SCREEN_W - 80, 430, 28, WHITE);
+  flushAll();
 }
 
 // Shown on screens the user can leave by tapping.
 void showExitHint() {
-  drawCentered(205, 452, "TAP SCREEN FOR HOME", 2, DIM);
+  drawTextCentered(FONT_SMALL, SCREEN_W / 2, 470, "Tap the screen for home",
+                   DIM);
+  flushArea(0, 450, SCREEN_W, 30);
+}
+
+// The status page: battery, Wi-Fi and the watch's address.
+void updateStatus() {
+  clearArea(0, 0, SCREEN_W, SCREEN_H);
+  renderHeader();
+
+  drawTextAA(FONT_LABEL, 40, 150, "Status", NEUTRAL_COLOUR);
+
+  String battery = "Battery: unavailable";
+  if (powerReady && power.isBatteryConnect()) {
+    int percent = power.getBatteryPercent();
+    if (percent >= 0 && percent <= 100) {
+      battery = "Battery: " + String(percent) + "%";
+      if (power.isCharging()) battery += " (charging)";
+    }
+  } else if (powerReady) {
+    battery = "Battery: none (USB power)";
+  }
+
+  drawTextAA(FONT_TEXT, 40, 200, battery, WHITE);
+  drawTextAA(FONT_TEXT, 40, 236,
+             WiFi.status() == WL_CONNECTED ? "Wi-Fi: connected"
+                                           : "Wi-Fi: not connected",
+             WHITE);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    drawTextAA(FONT_TEXT, 40, 272,
+               "Signal: " + String(WiFi.RSSI()) + " dBm", WHITE);
+    // The address the laptop sends the mood to.
+    drawTextAA(FONT_TEXT, 40, 308,
+               "Address: " + WiFi.localIP().toString(), WHITE);
+  }
+
+  drawTextAA(FONT_TEXT, 40, 344, "Mood: " + moodLabel(), moodAccent());
+
+  renderButton();
+  flushAll();
+  statusTime = millis();
+}
+
+void showStatusPage() {
+  homeVisible = false;
+  statusPage = true;
+  updateStatus();
 }
 
 void goHome() {
   awaitingAnswer = false;
   readingUntil = 0;
   showHome();
+}
+
+// Show the time in Montreal (Eastern time, with daylight saving).
+void setLocalTimezone() {
+  setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);
+  tzset();
 }
 
 bool fail(const String &reason) {
@@ -656,19 +1069,54 @@ void startMoodServer() {
   );
 }
 
+// Short, clean jokes for cheering up a sad user. A different one is
+// used each time; add or change lines freely.
+const char *JOKES[] = {
+  "Why did the scarecrow win an award? Because he was outstanding "
+  "in his field.",
+  "What do you call a fake noodle? An impasta.",
+  "Why don't eggs tell jokes? They would crack each other up.",
+  "What do you call a sleeping dinosaur? A dino-snore.",
+  "Why did the math book look sad? It had too many problems.",
+  "What do you call cheese that isn't yours? Nacho cheese.",
+  "Why can't you trust stairs? They're always up to something.",
+  "What did the ocean say to the beach? Nothing, it just waved.",
+};
+constexpr int JOKE_COUNT = sizeof(JOKES) / sizeof(JOKES[0]);
+int nextJokeIndex = 0;
+
+String nextJoke() {
+  String joke = JOKES[nextJokeIndex];
+  nextJokeIndex = (nextJokeIndex + 1) % JOKE_COUNT;
+  return joke;
+}
+
+// What the watch says for each mood. {JOKE} is replaced by a joke
+// when the check-in actually happens.
 String checkInQuestion() {
   if (currentMood == "sad") {
-    return "You look sad. Why are you sad?";
+    return "You seem down, so here's a joke: {JOKE} "
+           "Want to talk about it?";
   }
 
   if (currentMood == "mad") {
-    return "You seem upset. What is bothering you?";
+    return "Let's calm down together. Follow the light and "
+           "breathe with it: in as it gets brighter, out as "
+           "it fades.";
   }
 
-  return "";   // happy and neutral: nothing to ask
+  if (currentMood == "happy") {
+    return "I'm glad you're happy! If you want to share "
+           "the good news, I'm here.";
+  }
+
+  return "";   // neutral: nothing to ask
 }
 
-void runCheckIn(const String &question) {
+void runCheckIn(const String &message) {
+  String question = message;
+  question.replace("{JOKE}", nextJoke());
+
   lastQuestion = question;
 
   if (SPEAK_CHECK_IN) {
@@ -814,6 +1262,7 @@ bool connectNetwork() {
     }
   }
 
+  setLocalTimezone();
   return true;
 }
 
@@ -943,11 +1392,7 @@ bool recordQuestion(uint8_t *wav, size_t &wavLength) {
     }
   }
 
-  showMessage(
-    "AI mode activated",
-    "Listening... Hold the button. Release to send. "
-    "Maximum 8 seconds."
-  );
+  showListening();
 
   size_t sampleCount = 0;
   int peak = 0;
@@ -990,10 +1435,7 @@ bool recordQuestion(uint8_t *wav, size_t &wavLength) {
     }
 
     if (millis() - meterTime > 100) {
-      gfx->fillRect(35, 365, 340, 15, BLACK);
-      gfx->fillRect(
-        35, 365, min(340, blockPeak / 32), 15, CYAN
-      );
+      drawBars(blockPeak / 12);
       meterTime = millis();
     }
   }
@@ -1022,10 +1464,7 @@ bool askAI(
   size_t wavLength,
   String &answer
 ) {
-  showMessage(
-    "Thinking...",
-    "Sending your recording to Gemini."
-  );
+  showThinking();
 
   size_t encodedCapacity =
     4 * ((wavLength + 2) / 3) + 1;
@@ -1069,8 +1508,17 @@ bool askAI(
   if (awaitingAnswer) {
     prompt +=
       "You just asked them: \"" + lastQuestion + "\" "
-      "The recording is their reply. Respond with warmth "
-      "and offer one small, practical suggestion.";
+      "The recording is their reply. ";
+
+    if (currentMood == "happy") {
+      prompt +=
+        "They are sharing good news: celebrate it with them "
+        "warmly and ask one short follow-up question.";
+    } else {
+      prompt +=
+        "Respond with warmth and offer one small, practical "
+        "suggestion.";
+    }
   }
 
   JsonDocument request(&jsonMemory);
@@ -1135,7 +1583,7 @@ bool askAI(
 // GENERATE AND PLAY THE SPOKEN ANSWE
 
 bool speakAnswer(const String &answer) {
-  showMessage("Making speech...", answer);
+  showThinking();
 
   JsonDocument request(&jsonMemory);
 
@@ -1227,11 +1675,13 @@ bool speakAnswer(const String &answer) {
     return false;
   }
 
-  showMessage("Speaking...", answer);
+  showSpeaking(answer);
   digitalWrite(AMP_PIN, HIGH);
 
   int16_t stereo[512];
   bool ok = true;
+  int speechPeak = 0;
+  unsigned long barsTime = 0;
 
   for (size_t position = 0; position < audioBytes;) {
     size_t frames = min(
@@ -1251,6 +1701,16 @@ bool speakAnswer(const String &answer) {
       // Reduce amplitude for a moderate initial volume.
       stereo[2 * i] = sample / 2;
       stereo[2 * i + 1] = sample / 2;
+
+      int level = abs((int)sample);
+      if (level > speechPeak) speechPeak = level;
+    }
+
+    // Move the sound bars with the voice.
+    if (millis() - barsTime > 90) {
+      drawBars(speechPeak / 12);
+      speechPeak = 0;
+      barsTime = millis();
     }
 
     size_t bytesToWrite = frames * 4;
@@ -1316,59 +1776,6 @@ bool readTouch(int &x, int &y) {
   return fingers > 0 && x < 410 && y < 502;
 }
 
-void updateStatus() {
-  gfx->fillRect(25, 125, 360, 260, BLACK);
-
-  drawText(30, 135, "BATTERY", 2, CYAN);
-
-  if (!powerReady) {
-    drawText(30, 170, "Sensor unavailable", 2, WHITE);
-  } else if (!power.isBatteryConnect()) {
-    drawText(30, 170, "No battery detected", 2, WHITE);
-  } else {
-    int percent = power.getBatteryPercent();
-
-    String value =
-      percent >= 0 && percent <= 100
-        ? String(percent) + "%"
-        : "Unavailable";
-
-    drawText(30, 170, value, 3, WHITE);
-
-    drawText(
-      30, 210,
-      power.isCharging() ? "Charging" : "Not charging",
-      2, WHITE
-    );
-  }
-
-  drawText(30, 265, "WI-FI", 2, CYAN);
-
-  drawText(
-    30, 300,
-    WiFi.status() == WL_CONNECTED
-      ? "Connected"
-      : "Not connected",
-    2, WHITE
-  );
-
-  if (WiFi.status() == WL_CONNECTED) {
-    drawText(
-      30, 325,
-      "Signal: " + String(WiFi.RSSI()) + " dBm",
-      2, WHITE
-    );
-
-    // The address the laptop sends the mood to.
-    drawText(
-      30, 350,
-      "IP: " + WiFi.localIP().toString(),
-      2, WHITE
-    );
-  }
-
-  statusTime = millis();
-}
 // STARTU
 
 void setup() {
@@ -1380,6 +1787,14 @@ void setup() {
   digitalWrite(AMP_PIN, LOW);
 
   if (!gfx->begin()) {
+    while (true) delay(1000);
+  }
+
+  fb = gfx->getFramebuffer();
+  flushBuf = (uint16_t *)ps_malloc(SCREEN_W * 200 * 2);
+
+  if (!fb || !flushBuf) {
+    Serial.println("Not enough PSRAM for the screen. Select OPI PSRAM in Tools.");
     while (true) delay(1000);
   }
 
@@ -1510,22 +1925,38 @@ void loop() {
     }
   }
 
-  // Ask about a sad or mad mood once it has lasted a few seconds.
+  // Check in on a sad or mad mood:
+  //  - first time: once the mood has lasted CHECK_IN_AFTER_MS
+  //  - still sad or mad later: again every CHECK_IN_REPEAT_MS
+  //  - never sooner than CHECK_IN_COOLDOWN_MS after the last question;
+  //    if that blocks it, the watch waits and asks when allowed
+  //    (it no longer gives up on that mood).
+  // It also waits while a question or answer is on screen.
+  String question = checkInQuestion();
+
   if (
     !pressed &&
-    !checkInHandled &&
-    millis() - moodSince >= CHECK_IN_AFTER_MS
+    question.length() &&
+    !awaitingAnswer &&
+    readingUntil == 0
   ) {
-    checkInHandled = true;
+    unsigned long now = millis();
 
-    String question = checkInQuestion();
+    bool askedThisMood =
+      lastCheckIn != 0 && lastCheckIn >= moodSince;
+
+    // Happy gets one friendly message per happy spell, not repeats.
+    bool due = askedThisMood
+      ? currentMood != "happy" &&
+        now - lastCheckIn >= CHECK_IN_REPEAT_MS
+      : now - moodSince >= CHECK_IN_AFTER_MS;
 
     bool cooledDown =
       lastCheckIn == 0 ||
-      millis() - lastCheckIn >= CHECK_IN_COOLDOWN_MS;
+      now - lastCheckIn >= CHECK_IN_COOLDOWN_MS;
 
-    if (question.length() && cooledDown) {
-      lastCheckIn = millis();
+    if (due && cooledDown) {
+      lastCheckIn = now;
       runCheckIn(question);
     }
   }
@@ -1561,15 +1992,7 @@ void loop() {
         if (statusPage) {
           showHome();
         } else {
-          statusPage = true;
-          homeVisible = false;
-
-          gfx->fillScreen(BLACK);
-          drawCentered(205, 40, "STATUS", 4, moodAccent());
-          gfx->fillRect(150, 89, 110, 3, moodAccent());
-
-          drawCircleButton();
-          updateStatus();
+          showStatusPage();
         }
       }
     } else {
@@ -1586,17 +2009,8 @@ void loop() {
       updateStatus();
     }
   } else if (homeVisible) {
-    // Home screen animation: turning ring and pulsing core.
-    if (millis() - ringTime >= RING_FRAME_MS) {
-      stepRing();
-      ringTime = millis();
-    }
-
-    if (millis() - pulseTime >= PULSE_MS) {
-      pulseOn = !pulseOn;
-      drawCoreOutline(pulseOn);
-      pulseTime = millis();
-    }
+    // Home screen animation: moving wave and pulsing glow.
+    animateHome();
   }
 
   delay(15);

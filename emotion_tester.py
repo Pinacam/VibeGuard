@@ -1,8 +1,8 @@
 """
 Facial expression tester: happy / sad / mad / neutral.
 
-Runs on the laptop webcam or an ESP32-S3 camera stream and sends accepted
-mood labels to the configured board, watch and WiZ bulb.
+Runs on the laptop webcam now; later the same script can read the ESP32-S3
+camera stream and tell the board which mood to show.
 
     python emotion_tester.py                          laptop webcam
     python emotion_tester.py --source http://IP:81/stream      ESP32 camera
@@ -44,7 +44,8 @@ MOOD_COLOURS = {
 # ---- tuning -----------------------------------------------------------------
 NEUTRAL_THRESHOLD = 0.22   # rules mode: below this, nothing counts as an expression
 SMOOTHING = 0.35           # 0..1, higher = reacts faster but flickers more
-HOLD_FRAMES = 6            # frames a new mood must win before we switch to it
+HOLD_SECONDS = 3.0         # a new mood must win this long before outputs change
+MIN_MOOD_SECONDS = 8.0     # once changed, a mood stays at least this long
 CALIB_READY_SECONDS = 3.0  # time to pull the face
 CALIB_RECORD_SECONDS = 3.0 # time it is recorded for
 MIN_SEPARATION = 2.5       # calibration warns if two faces are closer than this
@@ -217,23 +218,30 @@ class PersonalModel:
 
 
 class MoodTracker:
-    """Smooths per-frame scores and only switches mood when it is held."""
+    """Smooths per-frame scores and only switches mood when it is held.
+
+    Timing is in seconds rather than frames, so it behaves the same whether
+    the camera delivers 5 or 25 frames a second.
+    """
 
     def __init__(self):
         self.smoothed = np.array([1.0, 0.0, 0.0, 0.0])
         self.mood = "neutral"
         self._candidate = "neutral"
-        self._count = 0
+        self._candidate_since = 0.0
+        self._mood_since = -MIN_MOOD_SECONDS
 
-    def update(self, scores):
+    def update(self, scores, now=None):
+        now = time.monotonic() if now is None else now
         self.smoothed = (1 - SMOOTHING) * self.smoothed + SMOOTHING * scores
         top = EMOTIONS[int(np.argmax(self.smoothed))]
-        if top == self._candidate:
-            self._count += 1
-        else:
-            self._candidate, self._count = top, 1
-        if self._candidate != self.mood and self._count >= HOLD_FRAMES:
+        if top != self._candidate:
+            self._candidate, self._candidate_since = top, now
+        if (self._candidate != self.mood
+                and now - self._candidate_since >= HOLD_SECONDS
+                and now - self._mood_since >= MIN_MOOD_SECONDS):
             self.mood = self._candidate
+            self._mood_since = now
             return True
         return False
 
@@ -303,16 +311,40 @@ def selftest():
     print(f"personal   identical sad/neutral gets flagged {'ok' if good else 'WRONG'}")
     ok &= good
 
+    # Timing, simulated at 6 frames a second.
     t = MoodTracker()
-    flips = sum(t.update(rule_scores(cases["happy" if i % 2 else "neutral"]))
-                for i in range(40))
-    print(f"smoothing  alternating frames caused {flips} switches "
-          f"{'ok' if flips <= 1 else 'WRONG'}")
-    ok &= flips <= 1
-    for _ in range(30):
-        t.update(rule_scores(cases["mad"]))
-    print(f"smoothing  held mad -> {t.mood} {'ok' if t.mood == 'mad' else 'WRONG'}")
-    ok &= t.mood == "mad"
+    clock = [0.0]
+
+    def feed(case, seconds):
+        changes = 0
+        for _ in range(int(seconds * 6)):
+            clock[0] += 1 / 6
+            changes += t.update(rule_scores(cases[case]), clock[0])
+        return changes
+
+    flips = sum(feed("happy" if i % 2 else "neutral", 1.0) for i in range(10))
+    print(f"timing     mood flickering every second caused {flips} switches "
+          f"{'ok' if flips == 0 else 'WRONG'}")
+    ok &= flips == 0
+    feed("neutral", 10)
+    feed("mad", HOLD_SECONDS - 0.7)
+    good = t.mood == "neutral"
+    print(f"timing     mad shorter than {HOLD_SECONDS:.0f} s ignored "
+          f"{'ok' if good else 'WRONG'}")
+    ok &= good
+    feed("mad", 1.5)
+    good = t.mood == "mad"
+    print(f"timing     mad held {HOLD_SECONDS:.0f} s -> {t.mood} {'ok' if good else 'WRONG'}")
+    ok &= good
+    feed("happy", MIN_MOOD_SECONDS - 2)
+    good = t.mood == "mad"
+    print(f"timing     mood kept at least {MIN_MOOD_SECONDS:.0f} s "
+          f"{'ok' if good else 'WRONG'}")
+    ok &= good
+    feed("happy", 3)            # now past the minimum time
+    good = t.mood == "happy"
+    print(f"timing     then switches to happy -> {t.mood} {'ok' if good else 'WRONG'}")
+    ok &= good
     print("ALL OK" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -348,6 +380,8 @@ class WizBulb:
         self.ip = None if address == "auto" else address
         self.searching = False
         self.warned = False
+        self.mood, self.mood_started = "neutral", time.monotonic()
+        self.effects_running = False
         if self.ip is None:
             self.find_in_background()
         else:
@@ -487,14 +521,68 @@ class WizBulb:
                     "right key and that this laptop's clock is correct.")
         return f"The bulb answered: {error}"
 
+    # ---- Light effects, aimed at moving the user toward happy or neutral ----
+    # mad:     slow "breathing" blue-violet; breathe in as it brightens,
+    #          out as it fades (the watch tells the user to follow it)
+    # sad:     party mode, cheerful colours hopping around
+    # happy:   warm gold that gently shimmers
+    # neutral: steady warm white
+    BREATH_SECONDS = 8.0          # one full breath: 4 s in, 4 s out
+    BREATH_COLOUR = {"r": 90, "g": 40, "b": 255}
+    PARTY_STEP_SECONDS = 1.0      # how long each party colour lasts
+    PARTY_COLOURS = [
+        {"r": 255, "g": 0, "b": 150},     # pink
+        {"r": 255, "g": 220, "b": 0},     # yellow
+        {"r": 0, "g": 255, "b": 80},      # green
+        {"r": 255, "g": 100, "b": 0},     # orange
+        {"r": 0, "g": 200, "b": 255},     # sky blue
+        {"r": 160, "g": 0, "b": 255},     # purple
+    ]
+    SHIMMER_COLOUR = {"r": 255, "g": 170, "b": 0}
+
+    def effect_frame(self, mood, t):
+        """Bulb settings for a mood at time t (seconds since it began)."""
+        import math
+        if mood == "mad":
+            phase = (t % self.BREATH_SECONDS) / self.BREATH_SECONDS
+            level = 0.5 - 0.5 * math.cos(2 * math.pi * phase)   # starts dim
+            return dict(self.BREATH_COLOUR, dimming=int(10 + 90 * level)), 0.25
+        if mood == "sad":
+            step = int(t / self.PARTY_STEP_SECONDS)
+            colour = self.PARTY_COLOURS[step % len(self.PARTY_COLOURS)]
+            return dict(colour, dimming=100), 0.2
+        if mood == "happy":
+            step = int(t / 0.5)
+            dimming = 75 + (step * 37) % 26          # 75-100, varies each step
+            return dict(self.SHIMMER_COLOUR, dimming=dimming), 0.5
+        return dict(self.SCENES["neutral"]), 1.0
+
+    def _run_effects(self):
+        last_sent, last_time = None, 0.0
+        while True:
+            mood, started = self.mood, self.mood_started
+            if self.ip is None:
+                self.find_in_background()
+                time.sleep(1.0)
+                continue
+            now = time.monotonic()
+            params, wait = self.effect_frame(mood, now - started)
+            # Only send when something changed (or every 5 s as a refresh).
+            if params != last_sent or now - last_time >= 5.0:
+                error = self.send(dict(params, state=True))
+                if error and not self.warned:
+                    print(f"Bulb: could not send ({error})")
+                    self.warned = True
+                last_sent, last_time = params, now
+            time.sleep(wait)
+
     def set_mood(self, mood):
-        if self.ip is None:
-            self.find_in_background()
-            return
-        error = self.send(dict(self.SCENES[mood], state=True))
-        if error and not self.warned:
-            print(f"Bulb: could not send ({error})")
-            self.warned = True
+        if mood != getattr(self, "mood", None):
+            self.mood = mood
+            self.mood_started = time.monotonic()
+        if not getattr(self, "effects_running", False):
+            self.effects_running = True
+            threading.Thread(target=self._run_effects, daemon=True).start()
 
 
 class FrameGrabber:
@@ -717,14 +805,19 @@ def main():
             print("No bulb answered. Check it is powered, set up in the WiZ app on "
                   "the same WiFi as this laptop, and that local communication is on.")
             return 1
-        for mood in ["happy", "sad", "mad", "neutral"]:
-            error = bulb.send(dict(bulb.SCENES[mood], state=True), wait_reply=True)
-            if error:
-                print(f"Bulb -> {mood}: FAILED. {bulb.explain(error)}")
-                return 1
-            print(f"Bulb -> {mood}: accepted")
-            time.sleep(2.5)
-        print("Done. The bulb accepted all four colours.")
+        error = bulb.send(dict(bulb.SCENES["neutral"], state=True), wait_reply=True)
+        if error:
+            print(f"Bulb: FAILED. {bulb.explain(error)}")
+            return 1
+        print("Bulb accepted a test command. Showing each mood's effect for 12 s:")
+        for mood, what in [("mad", "slow breathing - breathe in as it brightens"),
+                           ("sad", "party colours"),
+                           ("happy", "gold shimmer"),
+                           ("neutral", "steady warm white")]:
+            print(f"  {mood}: {what}")
+            bulb.set_mood(mood)
+            time.sleep(12)
+        print("Done.")
         return 0
 
     import cv2
